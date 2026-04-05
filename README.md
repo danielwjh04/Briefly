@@ -16,7 +16,22 @@ A personal Telegram bot for NUS Singapore students hunting for internships and f
 | `/profile [key=value ...]` | View or update your profile (name, degree, skills, GPA, year) |
 | `/clear` | Clear conversation history |
 
-**Photo upload:** Send a screenshot of an interview invitation and the bot will extract the company, role, date, and interviewer — then automatically run a full brief and generate likely interview questions.
+---
+
+## Fastest way to prep — upload your invitation screenshot
+
+Got an interview invite email? Skip typing entirely.
+
+1. Take a screenshot of the invitation email
+2. Send it directly to the bot in Telegram (tap the attachment icon, choose Photo)
+3. The bot will automatically:
+   - Extract the company, role, date, time, and interviewer name
+   - Log the application to your history
+   - Run a full pre-interview brief (same as `/brief`) instantly
+
+No need to type `/brief [Company] [Role]` — the bot reads the email for you.
+
+> **Tip:** Make sure the screenshot includes the structured details section of the email (role, date, interviewer). A full-length screenshot works best.
 
 ---
 
