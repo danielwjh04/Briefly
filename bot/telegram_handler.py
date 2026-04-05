@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from io import BytesIO
 
 from config import client, MODEL, SYSTEM_PROMPT
@@ -290,6 +291,91 @@ def _ocr_image(image_bytes: bytes) -> str:
     return "\n".join(results)
 
 
+def _parse_interview_fields_regex(ocr_text: str) -> dict:
+    """Extract interview fields from OCR text using regex patterns."""
+    text = ocr_text
+
+    details = {
+        "company": None,
+        "role": None,
+        "interview_date": None,
+        "interview_time": None,
+        "interviewer_name": None,
+        "other_details": None,
+    }
+
+    # Role: prefer explicit "Role:" label (requires colon, so it won't match
+    # the word "position" in body sentences like "...position at Grab...")
+    role_match = re.search(r'\brole\s*:\s*([^\n]+)', text, re.IGNORECASE)
+    if role_match:
+        details["role"] = role_match.group(1).strip(" -–—")
+    else:
+        # Fall back to "applying to the X position" sentence pattern
+        applying_match = re.search(
+            r'applying to the\s+(.+?)\s+position\b', text, re.IGNORECASE
+        )
+        if applying_match:
+            details["role"] = applying_match.group(1).strip()
+
+    # Company: extract from "position at [Company]" — stop at first non-alpha
+    # char (handles OCR artefacts like "Grab_" or "Grab.")
+    company_match = re.search(
+        r'\bposition at\s+([A-Za-z][A-Za-z0-9]*(?:\s[A-Z][A-Za-z0-9]*){0,2})',
+        text,
+    )
+    if company_match:
+        details["company"] = company_match.group(1).strip()
+    else:
+        labelled = re.search(r'\bcompany\s*:\s*([^\n]+)', text, re.IGNORECASE)
+        if labelled:
+            details["company"] = labelled.group(1).strip()
+
+    # Date: prefer "Date: Wednesday, 16 April 2025" label format.
+    # The labelled pattern requires a day-of-week OR bare date after "Date:".
+    date_match = re.search(
+        r'\bdate\s*:\s*([A-Za-z]+,?\s+\d{1,2}\s+[A-Za-z]+\s+\d{4})',
+        text, re.IGNORECASE,
+    )
+    if not date_match:
+        # Prefer dates that include a day-of-week (more likely to be the
+        # interview date than the email's sent-date header)
+        date_match = re.search(
+            r'\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)'
+            r',?\s+\d{1,2}\s+[A-Za-z]+\s+\d{4}\b',
+            text, re.IGNORECASE,
+        )
+    if not date_match:
+        # Last resort: any bare date — skips 1-2 digit day-only numbers
+        date_match = re.search(
+            r'\b(\d{1,2}\s+[A-Za-z]{3,}\s+\d{4})\b', text
+        )
+    if date_match:
+        details["interview_date"] = date_match.group(1).strip()
+
+    # Time: e.g. "2:00 PM – 3:00 PM SGT"
+    time_match = re.search(
+        r'(\d{1,2}:\d{2}\s*(?:AM|PM)\s*[-–—]\s*\d{1,2}:\d{2}\s*(?:AM|PM)'
+        r'(?:\s+[A-Z]{2,4})?)',
+        text, re.IGNORECASE,
+    )
+    if time_match:
+        details["interview_time"] = time_match.group(1).strip()
+
+    # Interviewer: labelled field
+    interviewer_match = re.search(
+        r'\binterviewer\s*:\s*([^\n]+)', text, re.IGNORECASE
+    )
+    if interviewer_match:
+        details["interviewer_name"] = interviewer_match.group(1).strip()
+
+    # Format / other details
+    format_match = re.search(r'\bformat\s*:\s*([^\n]+)', text, re.IGNORECASE)
+    if format_match:
+        details["other_details"] = format_match.group(1).strip()
+
+    return details
+
+
 async def handle_photo(update, context):
     """Handle uploaded interview invitation screenshot."""
     await update.message.reply_text(
@@ -315,51 +401,8 @@ async def handle_photo(update, context):
         await update.message.reply_text("Could not read any text from the image. Please try a clearer screenshot.")
         return
 
-    # Ask Agnes to parse the OCR text into structured fields
-    extract_messages = [
-        {
-            "role": "user",
-            "content": (
-                "The following text was extracted from an interview invitation email screenshot via OCR.\n\n"
-                f"OCR TEXT:\n{ocr_text}\n\n"
-                "Extract the following fields as a JSON object with these exact keys: "
-                "company, role, interview_date, interview_time, interviewer_name, other_details. "
-                "If a field is not present in the text, set it to null. "
-                "Return only valid JSON, no explanation."
-            ),
-        }
-    ]
-
-    try:
-        extract_response = await loop.run_in_executor(
-            None,
-            lambda: client.chat.completions.create(
-                model=MODEL,
-                messages=extract_messages,
-                max_tokens=512,
-                temperature=0.1,
-            ),
-        )
-        raw = extract_response.choices[0].message.content
-        if not raw:
-            await update.message.reply_text("Agnes could not parse the extracted text. Please try a clearer screenshot.")
-            return
-    except Exception as e:
-        await update.message.reply_text(f"Extraction failed: {e}")
-        return
-
-    # Parse extracted JSON
-    import json, re
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not json_match:
-        await update.message.reply_text(f"Could not parse extraction result:\n{raw}")
-        return
-
-    try:
-        details = json.loads(json_match.group(0))
-    except json.JSONDecodeError:
-        await update.message.reply_text(f"Could not parse extraction result:\n{raw}")
-        return
+    # Parse interview fields from OCR text using regex
+    details = _parse_interview_fields_regex(ocr_text)
 
     company = details.get("company") or "Unknown"
     role = details.get("role") or "Unknown"
@@ -418,39 +461,6 @@ async def handle_photo(update, context):
     store.append_conversation("assistant", brief)
 
     await _safe_reply(update.message, brief)
-
-    # Generate likely interview questions
-    questions_prompt = (
-        f"Generate exactly 5 likely interview questions for a {role} role at {company}. "
-        f"Make them specific to the company and role — mix behavioural, technical, and company-specific questions. "
-        f"Return a numbered list only, no intro text, no explanation. Use plain text."
-    )
-    q_messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": questions_prompt}]
-    questions_raw = await loop.run_in_executor(None, _call_agnes, q_messages)
-
-    # Parse numbered questions into a list
-    question_lines = []
-    for line in questions_raw.strip().splitlines():
-        line = line.strip()
-        if re.match(r"^\d+[\.\)]\s+", line):
-            question_lines.append(re.sub(r"^\d+[\.\)]\s+", "", line).strip())
-
-    if not question_lines:
-        question_lines = [l.strip() for l in questions_raw.strip().splitlines() if l.strip()]
-
-    user_id = update.effective_user.id
-    question_sessions[user_id] = {
-        "questions": question_lines,
-        "company": company,
-        "role": role,
-    }
-
-    numbered = "\n".join(f"{i+1}. {q}" for i, q in enumerate(question_lines))
-    await update.message.reply_text(
-        f"*Likely questions for this role:*\n\n{numbered}\n\n"
-        "Reply with a number (1\u2013" + str(len(question_lines)) + ") to get a recommended answer.",
-        parse_mode="Markdown",
-    )
 
 
 async def handle_question_answer(update, context, user_id: int) -> bool:
